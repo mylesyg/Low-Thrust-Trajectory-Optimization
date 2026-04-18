@@ -265,13 +265,14 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     # 4. compute_baseline
     # ------------------------------------------------------------------
-    print('Test 4: compute_baseline with default spacecraft params')
+    print('Test 4: compute_baseline with chemical propulsion spacecraft params')
+    print('        (bipropellant MMH/NTO: Isp=320 s, thrust=440 N)')
     from config.mission_config import MissionConfig
 
     cfg = MissionConfig(
         initial_mass_kg      = 5000.0,
-        thrust_N             = 3.5,
-        isp_s                = 3000.0,
+        thrust_N             = 440.0,   # bipropellant main engine [N]
+        isp_s                = 320.0,   # MMH/NTO bipropellant Isp [s]
         opt_mode             = 'time_optimal',
         n_segments           = 10,
         time_guess_days      = 200.0,
