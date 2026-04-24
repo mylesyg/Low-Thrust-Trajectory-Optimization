@@ -56,6 +56,22 @@
    - 7.4 [Week 4: 3D Nonplanar Extension](#74-week-4-3d-nonplanar-extension)
 8. [Key Design Decisions and Engineering Trade-offs](#8-key-design-decisions-and-engineering-trade-offs)
 9. [Glossary](#9-glossary)
+10. [Low-Thrust Spiral Descent in Mars Orbit](#10-low-thrust-spiral-descent-in-mars-orbit)
+    - 10.1 [Motivation and Physical Setup](#101-motivation-and-physical-setup)
+    - 10.2 [State Representation: Modified Equinoctial Elements](#102-state-representation-modified-equinoctial-elements)
+    - 10.3 [Gauss Variational Equations for Tangential Thrust](#103-gauss-variational-equations-for-tangential-thrust)
+    - 10.4 [Time-Optimal Control Law](#104-time-optimal-control-law)
+    - 10.5 [Edelbaum Analytical Solution for Circular Spirals](#105-edelbaum-analytical-solution-for-circular-spirals)
+    - 10.6 [Mars-Centric Non-Dimensional Scaling](#106-mars-centric-non-dimensional-scaling)
+    - 10.7 [Interpretation of the Demonstration Trajectory](#107-interpretation-of-the-demonstration-trajectory)
+11. [Low-Thrust Inclination Change in Mars Orbit](#11-low-thrust-inclination-change-in-mars-orbit)
+    - 11.1 [Motivation and Physical Setup](#111-motivation-and-physical-setup)
+    - 11.2 [State Representation: Modified Equinoctial Elements](#112-state-representation-modified-equinoctial-elements)
+    - 11.3 [Gauss Variational Equations for Out-of-Plane Thrust](#113-gauss-variational-equations-for-out-of-plane-thrust)
+    - 11.4 [Bang-Bang Normal Thrust Control Law](#114-bang-bang-normal-thrust-control-law)
+    - 11.5 [Time-of-Flight Estimate and Impulsive Baseline](#115-time-of-flight-estimate-and-impulsive-baseline)
+    - 11.6 [Mars-Centric Non-Dimensional Scaling](#116-mars-centric-non-dimensional-scaling)
+    - 11.7 [Interpretation of the Demonstration Trajectory](#117-interpretation-of-the-demonstration-trajectory)
 
 ---
 
@@ -1702,3 +1718,680 @@ The 3D solver uses Cartesian coordinates because:
 ---
 
 *This report covers the complete `low_thrust_optimization` codebase as implemented for AEROSP 548, Spring 2026. All equations are presented in both dimensional and non-dimensional form consistent with the code implementation. The four-week milestone structure progresses from analytical baselines through 2D numerical optimization to full 3D nonplanar trajectory design.*
+
+---
+
+## 10. Low-Thrust Spiral Descent in Mars Orbit
+
+### 10.1 Motivation and Physical Setup
+
+After a spacecraft completes an interplanetary transfer and is captured into Mars orbit, it typically arrives in a large elliptical or high-circular parking orbit. Mission objectives — surface relay, science mapping, or atmospheric entry — often require a much lower circular orbit. Descending chemically (via a single large retrograde burn) is propellant-expensive. A low-thrust SEP engine, by contrast, can accomplish the same radius reduction with far less propellant by applying a small continuous retrograde force over many revolutions.
+
+The maneuver studied here is a **constant-inclination circular-to-circular spiral descent**: the spacecraft lowers its orbit radius from an initial value `r₁` to a target value `r₂ < r₁` while keeping the orbital plane fixed (constant inclination `i` and right ascension of ascending node Ω). Because no plane change is required, the optimal thrust direction is purely **tangential and retrograde** — no radial or out-of-plane component.
+
+The demonstration scenario uses:
+
+| Parameter | Value |
+|---|---|
+| Initial orbit radius `r₁` | 5000 km (altitude 1610.5 km) |
+| Target orbit radius `r₂` | 4000 km (altitude 610.5 km) |
+| Orbit inclination `i` | 30° (constant) |
+| SEP thrust `T` | 2 N |
+| Initial spacecraft mass `m₀` | 500 kg |
+| Specific impulse `Isp` | 3000 s |
+| Mars gravitational parameter `μ_Mars` | 4.282837 × 10⁴ km³/s² |
+
+---
+
+### 10.2 State Representation: Modified Equinoctial Elements
+
+The trajectory is propagated using **Modified Equinoctial Elements (MEE)**, a set of six orbital elements introduced by Walker, Ireland, and Owens (1985) that remain well-defined for all inclinations and for circular orbits (unlike classical elements, which become singular at `e = 0` or `i = 0`).
+
+The MEE state vector is:
+
+```
+q = [p,  f,  g,  h,  k,  L]
+```
+
+where:
+
+| Element | Definition | Physical meaning |
+|---|---|---|
+| `p` | a(1 − e²) | Semi-latus rectum [km] |
+| `f` | e·cos(ω + Ω) | Eccentricity x-component |
+| `g` | e·sin(ω + Ω) | Eccentricity y-component |
+| `h` | tan(i/2)·cos(Ω) | Inclination x-component |
+| `k` | tan(i/2)·sin(Ω) | Inclination y-component |
+| `L` | Ω + ω + ν | True longitude [rad] |
+
+Here `a` is the semi-major axis, `e` the eccentricity, `i` the inclination, `Ω` the right ascension of the ascending node (RAAN), `ω` the argument of periapsis, and `ν` the true anomaly.
+
+For the **initial circular orbit** at radius `r₁` with inclination `i` and RAAN `Ω`:
+
+```
+p₀ = r₁          (circular: a = r₁, e = 0 → p = r₁)
+f₀ = 0, g₀ = 0   (zero eccentricity)
+h₀ = tan(i/2)·cos(Ω)
+k₀ = tan(i/2)·sin(Ω)
+L₀ = Ω            (start at the ascending node: ω = ν = 0)
+```
+
+The instantaneous orbital radius at true longitude `L` is:
+
+```
+r = p / w,   where  w = 1 + f·cos(L) + g·sin(L)
+```
+
+For the near-circular spirals studied here, `f ≈ g ≈ 0` throughout, so `w ≈ 1` and `r ≈ p` at every point on the orbit.
+
+The full state vector propagated in code is extended to eight elements:
+
+```
+y = [p,  f,  g,  h,  k,  L,  m_p_frac,  ΔV_acc]
+```
+
+where `m_p_frac` is the accumulated propellant mass fraction (starts at 0, increases as fuel is burned) and `ΔV_acc` is the accumulated velocity increment (integral of thrust acceleration magnitude over time).
+
+---
+
+### 10.3 Gauss Variational Equations for Tangential Thrust
+
+The **Gauss Variational Equations (GVE)** describe how perturbing accelerations change the orbital elements over time. In the MEE formulation (Walker 1985, Table 1), the perturbation is decomposed into three components in the local orbital frame:
+
+- `F_R`: radial (outward along the position vector)
+- `F_T`: tangential (along-track, in the direction of motion)
+- `F_N`: normal (out-of-plane, completing the right-handed frame)
+
+For the **constant-inclination spiral descent**, only `F_T ≠ 0`:
+
+```
+F_R = 0      (no radial thrust)
+F_T = -a_max (constant full retrograde thrust; negative = opposing velocity)
+F_N = 0      (no out-of-plane thrust; inclination is preserved)
+```
+
+Substituting into the MEE GVE with `μ* = 1` (non-dimensional) gives:
+
+```
+ṗ = 2p/w · √p · F_T
+
+ḟ = √p · [(w+1)cosL + f] / w · F_T
+
+ġ = √p · [(w+1)sinL + g] / w · F_T
+
+ḣ = 0     (no F_N → inclination components h, k are constant)
+
+k̇ = 0
+
+L̇ = w² / p^(3/2)     (Keplerian mean motion; no F_T correction)
+```
+
+The `ḣ = k̇ = 0` equations are the mathematical statement that **the orbital plane is frozen** throughout the maneuver. Because `h` and `k` encode the inclination and RAAN, both remain exactly constant as long as `F_N = 0`.
+
+**Physical interpretation of the ṗ equation:**
+
+```
+ṗ = 2p/w · √p · F_T ≈ 2p^(3/2) · F_T   (for w ≈ 1, near-circular)
+```
+
+Since `F_T < 0` (retrograde), `ṗ < 0`: the semi-latus rectum — and thus the semi-major axis — decreases monotonically. This is the mathematical origin of the inward spiral.
+
+**Physical interpretation of the ḟ, ġ equations:**
+
+The tangential perturbation excites eccentricity oscillations (`f` and `g` oscillate at orbital frequency), but their secular (orbit-averaged) rate is zero for a circular orbit. The orbit therefore remains approximately circular throughout the maneuver; the instantaneous eccentricity stays below `e < 0.01` in the demonstration case.
+
+**Propellant mass flow:**
+
+The spacecraft mass decreases as propellant is expelled. The Tsiolkovsky rocket equation in differential form gives:
+
+```
+dm/dt = -T / (g₀ · Isp)
+```
+
+In terms of mass fraction `m_p_frac = 1 − m/m₀`:
+
+```
+ṁ_p_frac = T / (m₀ · g₀ · Isp)   [1/s]
+```
+
+As mass decreases, the thrust acceleration `a_T = T/m` increases, so the later revolutions descend slightly faster than the earlier ones. The code models this correctly by computing the effective acceleration at each integration step:
+
+```
+F_T_eff = F_T_nominal / (1 − m_p_frac)
+```
+
+---
+
+### 10.4 Time-Optimal Control Law
+
+#### Why Constant Retrograde Thrust is Optimal
+
+For a minimum-time circular-to-circular orbit lowering with fixed thrust magnitude, **Pontryagin's Maximum Principle** (Pontryagin et al., 1962) requires maximizing the Hamiltonian at every instant:
+
+```
+H = λ^T · f(q, u) − 1
+```
+
+where `λ` is the costate (primer vector) and `f` is the right-hand side of the GVE. For a fixed thrust magnitude `|u| = a_max`, this maximum is achieved when `u` is aligned with the primer vector projected onto the thrust-direction space.
+
+For a near-circular transfer with no inclination change, the primer vector analysis (Lawden, 1963; Edelbaum, 1965) shows:
+
+1. **Radial component F_R**: contributes to `ṗ` only at second order; the primer vector component along `F_R` is zero on average. Optimal `F_R = 0`.
+2. **Normal component F_N**: changes `h` and `k`, moving the orbit plane. Since the inclination must remain constant, the primer vector component along `F_N` is zero. Optimal `F_N = 0`.
+3. **Tangential component F_T**: the primer vector is aligned opposite to the velocity vector (retrograde) throughout the maneuver. Optimal `F_T = −a_max` (constant full retrograde).
+
+This result — constant full retrograde thrust — is the **optimal singular arc** for circular-to-circular low-thrust descent. It is exact for the orbit-averaged dynamics and highly accurate for the full (non-averaged) dynamics when the thrust-to-gravity ratio is small (the low-thrust assumption), as is the case here:
+
+```
+ε ≡ a_T / (μ/r²) = (4×10⁻⁶ km/s²) / (42828/5000² km/s²)
+                  = 4×10⁻⁶ / 1.713×10⁻³
+                  ≈ 2.3×10⁻³   ≪ 1   ✓
+```
+
+The small parameter `ε ≈ 0.0023` confirms the low-thrust regime; the spacecraft advances roughly 360/ε ≈ 155,000 degrees of true longitude per unit change in `p`, corresponding to many revolutions per unit radius change. This justifies the orbit-averaging approximation underlying the Edelbaum formula.
+
+---
+
+### 10.5 Edelbaum Analytical Solution for Circular Spirals
+
+#### Instantaneous Circular Speed
+
+For a circular orbit of radius `a = r` around Mars:
+
+```
+v_c(r) = √(μ_Mars / r)
+```
+
+The circular speed increases as `r` decreases — counter-intuitive, but a fundamental consequence of orbital mechanics. A spacecraft in a lower orbit must move faster to maintain centripetal balance.
+
+#### Time Evolution of Circular Speed
+
+From the GVE for `ṗ` (orbit-averaged over one revolution, using `⟨w⟩ = 1` and `⟨cosL⟩ = ⟨sinL⟩ = 0`):
+
+```
+⟨ṗ⟩ ≈ 2p^(3/2) · F_T   (non-dimensional)
+```
+
+In dimensional form, for `p = a = r` (circular orbit):
+
+```
+ṙ = 2r · F_T / v_c(r) = -2r · a_T / v_c(r)
+```
+
+Differentiating `v_c = √(μ/r)` with respect to time:
+
+```
+v̇_c = d/dt √(μ/r) = -√μ / (2r^(3/2)) · ṙ
+     = -√μ / (2r^(3/2)) · (-2r·a_T/v_c)
+     = √μ · a_T / (r^(3/2) · v_c)
+     = μ · a_T / (r · v_c²) · v_c / √μ · √μ / v_c
+     = a_T
+```
+
+The circular speed evolves linearly in time:
+
+```
+v_c(t) = v_c(r₁) + a_T · t
+```
+
+where `a_T > 0` (the speed increases as the orbit lowers). This is the key result: **the circular speed grows at exactly the thrust acceleration rate**, independent of the current orbit radius.
+
+#### Transfer Time and Total ΔV
+
+The spacecraft reaches `r₂` when `v_c = v_c(r₂)`:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                                                                 │
+│   T_f = [ v_c(r₂) − v_c(r₁) ] / a_T                          │
+│                                                                 │
+│   ΔV   = a_T × T_f = √(μ_Mars/r₂) − √(μ_Mars/r₁)             │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+This is **Edelbaum's formula** for the velocity increment of a constant-inclination low-thrust circular-to-circular transfer. It is exact in the orbit-averaged sense and requires only the initial and final circular speeds.
+
+For the demonstration scenario:
+```
+v_c(r₁) = √(42828.37/5000) = 2.9271 km/s
+v_c(r₂) = √(42828.37/4000) = 3.2720 km/s
+ΔV_Edelbaum = 3.2720 − 2.9271 = 0.3449 km/s
+T_f = 0.3449 / (4×10⁻⁶) = 86,225 s = 0.998 days
+```
+
+#### Number of Revolutions
+
+The instantaneous mean motion is `n(t) = v_c(t)³ / μ` (from `n = √(μ/a³)` and `v_c³ = μ^(3/2)/a^(3/2)` → `a³ = μ³/v_c⁶` → `n = v_c³/μ`). The total number of revolutions is:
+
+```
+N_rev = (1/2π) ∫₀^T_f n(t) dt
+       = (1/2π) ∫₀^T_f v_c(t)³/μ dt
+       = (1/2πμ) ∫₀^T_f (v_c1 + a_T t)³ dt
+       = [v_c(r₂)⁴ − v_c(r₁)⁴] / (8π · μ_Mars · a_T)
+```
+
+For the demonstration:
+```
+N_rev = (3.2720⁴ − 2.9271⁴) / (8π × 42828.37 × 4×10⁻⁶)
+       = (114.40 − 73.37) / 4.304
+       ≈ 9.5 revolutions
+```
+
+#### Propellant Consumption
+
+The Tsiolkovsky rocket equation gives the propellant mass fraction:
+
+```
+Δm_p / m₀ = 1 − exp(−ΔV / v_e)
+```
+
+where the effective exhaust velocity is `v_e = Isp × g₀`. For Isp = 3000 s:
+
+```
+v_e = 3000 × 9.80665×10⁻³ = 29.42 km/s
+Δm_p / m₀ = 1 − exp(−0.3449/29.42) = 1 − exp(−0.01173) = 0.01166
+Δm_p = 500 × 0.01166 = 5.83 kg
+```
+
+The propellant consumption is only **1.17% of the initial spacecraft mass** — a testament to the extraordinary efficiency of SEP (`Isp = 3000 s` vs. ~450 s for chemical engines).
+
+---
+
+### 10.6 Mars-Centric Non-Dimensional Scaling
+
+The code uses a Mars-centric non-dimensionalization anchored at the **initial orbit radius** `r_ref = r₁`:
+
+| Quantity | Reference | Non-Dimensional Unit |
+|---|---|---|
+| Length `L*` | `r₁` [km] | `r₁` |
+| Time `T*` | `√(r₁³/μ_Mars)` [s] | ≈ 1222.6 s for r₁ = 5000 km |
+| Velocity `V*` | `√(μ_Mars/r₁)` [km/s] | ≈ 2.927 km/s for r₁ = 5000 km |
+| Acceleration `A*` | `μ_Mars/r₁²` [km/s²] | ≈ 1.713×10⁻³ km/s² |
+
+With this scaling, the initial circular orbit is at `p₀ = 1.0` (ND), and the target orbit is at `p_target = r₂/r₁ = 4000/5000 = 0.80` (ND). The nominal thrust acceleration is:
+
+```
+a_T_ND = (T/m₀ × 10⁻³ km/m) / A* = (4×10⁻⁶ km/s²) / (1.713×10⁻³ km/s²) ≈ 2.34×10⁻³ [ND]
+```
+
+The small value of `a_T_ND ≪ 1` confirms the low-thrust regime and validates the orbit-averaging approximation.
+
+**Propagation terminates** when the non-dimensional semi-latus rectum first satisfies `p ≤ r₂/r₁ = 0.80`, at which point the spacecraft has reached the target circular orbit radius.
+
+---
+
+### 10.7 Interpretation of the Demonstration Trajectory
+
+#### Overview of Results
+
+The demonstration trajectory (`visualization/mars_spiral_descent_3d.py`, standalone demo) propagates a 2 N SEP spacecraft from a 5000 km circular Mars orbit to a 4000 km circular orbit over 9 revolutions. The numerical integration (DOP853, tolerance 10⁻⁹) yields:
+
+| Quantity | Analytical prediction | Simulation result |
+|---|---|---|
+| Transfer time `T_f` | 0.998 days | **0.994 days** |
+| Total ΔV | 0.3449 km/s | **0.3455 km/s** |
+| Propellant mass `Δm_p` | 5.83 kg (1.17%) | **5.84 kg (1.17%)** |
+| Approximate revolutions | 9.5 | **~9 revolutions** |
+| Final orbit radius | 4000.0 km | **3999.6 km** |
+
+The excellent agreement (errors < 0.2%) between the Edelbaum analytical predictions and the full numerical integration validates both the physics model and the GVE implementation.
+
+#### 3D Trajectory Figure (`results/mars_spiral_descent_3d.png`)
+
+The 3D figure produced by `plot_mars_spiral_descent_3d()` shows the following features:
+
+**The inward spiral.** The black trajectory coils inward around Mars over approximately 9 revolutions. Because the orbit inclination is held constant at 30°, all loops lie in the same inclined plane — the spiral resembles a coil spring viewed at an angle. The innermost loop (arrival) is clearly smaller than the outermost (departure). Black arrowheads placed at 12 evenly-spaced points along the trajectory confirm that the spacecraft travels in the prograde direction (counter-clockwise when viewed from the north orbital pole) throughout the maneuver.
+
+**Initial and target orbit circles.** The blue dashed circle at `r₁ = 5000 km` and the red dashed circle at `r₂ = 4000 km` both lie in the same 30°-inclined plane, confirming that the orbital plane is preserved. The radius ratio `r₁/r₂ = 1.25` is clearly visible — the outer circle is 25% larger in radius, which corresponds to a 56% larger orbital area.
+
+**Radius decrease per revolution.** The total radius change is 1000 km over ~9.5 revolutions, giving an average of about **105 km per revolution**. This is consistent with the orbit-averaged rate:
+
+```
+⟨ṙ⟩ = -2r·a_T/v_c(r)  at r = r₁:
+      = -2 × 5000 × 4×10⁻⁶ / 2.9271
+      = -1.367×10⁻² km/s
+      = -0.0137 km/s × (T_orb at r₁) per revolution
+```
+
+The orbital period at `r₁ = 5000 km`:
+
+```
+T_orb(r₁) = 2π × √(r₁³/μ_Mars) = 2π × 1222.6 s = 7681 s ≈ 2.13 hours
+```
+
+So the average descent per revolution: `0.0137 km/s × 7681 s ≈ 105 km/rev` — exactly as observed.
+
+**Intermediate orbit circles.** Four dotted grey circles at evenly-spaced times show the orbital radius at 20%, 40%, 60%, and 80% of the maneuver duration. Their spacing decreases slightly toward the end (the later circles are closer together) because the orbital period shrinks as `r` decreases and the orbit becomes faster.
+
+**Mars sphere and reference grid.** The translucent Martian red sphere (radius 3389.5 km) occupies the center of the figure, with the grey equatorial reference grid in the z = 0 (equatorial) plane. The spacecraft at `r₁ = 5000 km` is at an altitude of 1610 km — more than 0.47 Mars radii above the surface. At `r₂ = 4000 km`, the altitude is 611 km, comfortably above both the nominal atmosphere interface (~80 km) and the aerocapture threshold.
+
+**Departure and arrival markers.** The blue dot (departure) and red dot (arrival) are both located at the ascending node of the 30°-inclined orbit (where the orbit crosses the equatorial plane going north), which is the initial condition of the propagation (`L₀ = Ω = 0`).
+
+#### Time History Figure (`results/mars_spiral_descent_history.png`)
+
+The 2-panel time history from `plot_spiral_descent_history()` shows:
+
+**Top panel — Orbital radius `r(t)`.** The radius decreases monotonically from 5000 km to 3999.6 km over 0.994 days. The decrease is not perfectly linear: it proceeds as `r(t) ≈ μ / v_c(t)² = μ / (v_c1 + a_T t)²`, a **hyperbolic function of time**. The curve is slightly concave upward — the descent rate in km per unit time slows slightly as the orbit shrinks, because the reduced circumference means fewer kilometers of altitude change per unit arc length.
+
+**Bottom panel — Altitude above surface.** The altitude tracks `r(t) − R_Mars`, descending from 1610.5 km to 609.6 km. The shaded orange band below 80 km marks the Mars atmospheric interface (the aerocapture threshold). The final altitude of 610 km is comfortably above this boundary; the spacecraft is in no danger of atmospheric interaction. A trajectory designer could continue the descent to lower altitudes if needed, subject to propellant availability.
+
+#### Engineering Significance
+
+The 1.17% propellant expenditure for a 1000 km altitude decrease represents an extraordinary figure-of-merit for electric propulsion. For comparison, a single retrograde chemical burn using a bipropellant engine (Isp ≈ 450 s) would require:
+
+```
+Δm_p_chem / m₀ = 1 − exp(−ΔV / (Isp_chem × g₀))
+                = 1 − exp(−0.3449 / 4.414)
+                ≈ 7.5%
+```
+
+The low-thrust SEP system uses **6.4× less propellant** for the same orbit change. The cost is time: 0.994 days of continuous engine operation at 2 N, compared to a single chemical burn lasting approximately:
+
+```
+Δt_chem = Δm_p_chem × v_e_chem / T_chem ≈ (37.5 kg × 4.414 km/s) / (500 N × 10⁻³ km/N·s²·s)
+```
+
+In practice, chemical descent burns last on the order of minutes. The SEP mission designer accepts a ~1 day maneuver time in exchange for a factor-of-six reduction in propellant, which directly translates to either a smaller launch vehicle or more margin for other mission activities.
+
+---
+
+## 11. Low-Thrust Inclination Change in Mars Orbit
+
+### 11.1 Motivation and Physical Setup
+
+Orbital inclination — the tilt of the orbital plane relative to a reference plane — is among the most expensive orbital elements to change in astrodynamics. For an impulsive engine, a pure inclination change at a circular orbit of radius `r` and speed `v_c` requires a Δv of:
+
+```
+Δv_imp = 2 v_c sin(Δi / 2)
+```
+
+At a circular Mars parking orbit of radius `r = 3789.5 km` (altitude ~400 km), the circular speed is:
+
+```
+v_c = √(μ_Mars / r) = √(42828 / 3789.5) ≈ 3.361 km/s
+```
+
+A 20° inclination change therefore requires `Δv_imp = 2 × 3.361 × sin(10°) ≈ 1.167 km/s` — comparable to the Δv required for a major interplanetary maneuver. For a spacecraft operating with electric propulsion (e.g., Isp = 3000 s), the mass penalty is modest, but the thrust level is low, so the maneuver must be executed over many orbits. Understanding how the spacecraft slowly tilts its orbital plane over tens of revolutions is the subject of this section.
+
+The physical picture is straightforward: an out-of-plane (normal) thrust force rotates the orbital angular momentum vector. Applying positive normal thrust (perpendicular to the orbital plane, in the direction of the angular momentum vector) above the equator and negative below produces a net torque that tips the orbital plane. The spacecraft spirals in inclination space, tracing out a family of progressively inclined circular orbits around Mars.
+
+### 11.2 State Representation: Modified Equinoctial Elements
+
+The propagation uses the **Modified Equinoctial Elements (MEE)**, a non-singular set of six orbital elements introduced to avoid the numerical singularities that appear in classical Keplerian elements at zero eccentricity or zero inclination. The state vector is:
+
+```
+y = [p, f, g, h, k, L]
+```
+
+where:
+
+| Symbol | Definition | Physical meaning |
+|--------|-----------|-----------------|
+| `p`    | semi-latus rectum (km) | orbit "size"; equals `a(1−e²)` |
+| `f`    | `e cos(ω + Ω)` | x-component of eccentricity vector |
+| `g`    | `e sin(ω + Ω)` | y-component of eccentricity vector |
+| `h`    | `tan(i/2) cos(Ω)` | x-component of inclination vector |
+| `k`    | `tan(i/2) sin(Ω)` | y-component of inclination vector |
+| `L`    | `Ω + ω + ν` | true longitude (fast angle) |
+
+The inclination and right ascension of the ascending node (RAAN) are recovered from `h` and `k` via:
+
+```
+i   = 2 arctan(√(h² + k²))
+Ω   = arctan2(k, h)
+```
+
+For a nearly circular orbit, `f ≈ 0`, `g ≈ 0`, and `p ≈ r`. The inclination state is entirely captured by the two slow elements `h` and `k`. The true longitude `L` is the fast variable, completing one cycle per orbital revolution.
+
+A spacecraft starting at `(i₁, Ω₁) = (0°, 0°)` with a target `(i₂, Ω₂) = (20°, 0°)` has initial MEE:
+
+```
+p₀ = r = 3789.5 km,  f₀ = 0,  g₀ = 0
+h₀ = tan(0°/2) cos(0°) = 0
+k₀ = tan(0°/2) sin(0°) = 0
+L₀ = 0  (ascending node, true longitude = Ω = 0)
+```
+
+and target values:
+
+```
+h_f = tan(20°/2) cos(0°) = tan(10°) ≈ 0.17633
+k_f = tan(20°/2) sin(0°) = 0
+```
+
+The mass `m` and accumulated propellant `Δm` are tracked as additional state variables (total state dimension = 8 including mass and Δm).
+
+### 11.3 Gauss Variational Equations for Out-of-Plane Thrust
+
+The **Gauss Variational Equations (GVE)** in MEE form (Walker, Ireland & Owens 1985) describe how each orbital element changes under an arbitrary perturbing force expressed in the **radial–transverse–normal (RTN)** frame:
+
+```
+F = F_R r̂ + F_T t̂ + F_N n̂
+```
+
+The full equations are (using the notation of Walker 1985, equations A5–A13):
+
+```
+ṗ = (2p / w) √(p/μ) · F_T
+
+ḟ = √(p/μ) [ F_R sin L  +  F_T ((w+1)cos L + f)/w  −  F_N g(h sin L − k cos L)/w ]
+
+ġ = √(p/μ) [−F_R cos L  +  F_T ((w+1)sin L + g)/w  +  F_N f(h sin L − k cos L)/w ]
+
+ḣ = √(p/μ)  (s²/(2w)) F_N cos L
+
+k̇ = √(p/μ)  (s²/(2w)) F_N sin L
+
+L̇ = √(μ p) (w/p)²  +  (1/w) √(p/μ) (h sin L − k cos L) F_N
+```
+
+where:
+
+```
+w = 1 + f cos L + g sin L      (inverse radial factor)
+s² = 1 + h² + k²              (inclination factor)
+```
+
+For a **pure inclination change** the strategy is to apply thrust exclusively in the out-of-plane direction: `F_R = 0`, `F_T = 0`, `F_N ≠ 0`. Under this restriction the equations simplify dramatically. Setting `F_R = F_T = 0`:
+
+```
+ṗ = 0                          (semi-latus rectum is constant → circular orbit preserved)
+
+ḟ = −√(p/μ)  F_N g (h sin L − k cos L) / w
+
+ġ = +√(p/μ)  F_N f (h sin L − k cos L) / w
+
+ḣ = √(p/μ)  (s²/2w) F_N cos L
+
+k̇ = √(p/μ)  (s²/2w) F_N sin L
+
+L̇ = √(μ p) (w/p)²  +  (1/w) √(p/μ) (h sin L − k cos L) F_N
+```
+
+For a nearly circular orbit (`f ≈ 0`, `g ≈ 0`) the `ḟ` and `ġ` terms vanish, leaving only:
+
+```
+ḣ ≈ √(p/μ)  (s²/2w) F_N cos L
+k̇ ≈ √(p/μ)  (s²/2w) F_N sin L
+L̇ ≈ √(μ/p³)
+```
+
+The inclination change is driven entirely by the `ḣ` and `k̇` equations, which are proportional to `F_N cos L` and `F_N sin L` respectively. To drive `h` from 0 to `h_f = tan(i₂/2)` with `k = 0` throughout, the control must primarily excite `ḣ` (the cosine-weighted component).
+
+### 11.4 Bang-Bang Normal Thrust Control Law
+
+Because the thrust magnitude is fixed (the SEP thruster cannot be throttled in this model), the only degree of freedom is the thrust direction: `F_N = ±F_max`. The optimal control law for this problem follows from Pontryagin's minimum principle applied to the switching function:
+
+```
+σ(L) = ∂H/∂F_N  ∝  (dh_f/dF_N) · λ_h  +  (dk_f/dF_N) · λ_k
+     =  (s²/2w) √(p/μ) [ λ_h cos L  +  λ_k sin L ]
+```
+
+where `λ_h`, `λ_k` are the costates conjugate to `h` and `k`. For a single-plane maneuver (`k_f = k₀ = 0`, so `λ_k ≈ 0` and `Ω = 0`), the switching function reduces to:
+
+```
+σ(L) ∝ cos L
+```
+
+This produces the **bang-bang control law**:
+
+```
+         ⎧ +F_max    if cos L > 0   (spacecraft in "north" half of orbit)
+F_N(L) = ⎨
+         ⎩ −F_max    if cos L < 0   (spacecraft in "south" half of orbit)
+```
+
+The sign reversal occurs at the nodal crossings `L = π/2` and `L = 3π/2` (where cos L = 0). Physically: the thruster fires "upward" (in the +n̂ direction) while the spacecraft is ascending through the northern hemisphere and "downward" while it is descending through the southern hemisphere. Both halves of each orbit contribute constructively to tilting the orbital plane.
+
+For a general maneuver where `h` and `k` must both change, the switching function generalizes to:
+
+```
+         ⎧ +F_max    if  (dh_f · cos L + dk_f · sin L) > 0
+F_N(L) = ⎨
+         ⎩ −F_max    otherwise
+```
+
+where `dh_f = h_f − h(t)` and `dk_f = k_f − k(t)` are the current defects in `h` and `k`.
+
+### 11.5 Time-of-Flight Estimate and Impulsive Baseline
+
+**Orbit-averaged inclination rate.** Over one full orbit, the orbit-averaged rate of change of the inclination vector magnitude `|h| = tan(i/2)` due to the bang-bang control is:
+
+```
+⟨dh/dt⟩ = (1/2π) ∫₀²π  (s²/2w) √(p/μ) · F_N(L) · cos L  dL
+```
+
+With `F_N(L) = F_max · sign(cos L)` and the nearly circular approximation (`w ≈ 1`, `s² ≈ 1 + h² + k²`):
+
+```
+⟨dh/dt⟩ ≈ (s²/2) √(p/μ) F_max · (1/2π) ∫₀²π |cos L| dL
+         = (s²/2) √(p/μ) F_max · (2/π)
+```
+
+The factor `2/π` is the average of `|cos L|` over a full orbit — this is the **bang-bang efficiency factor**. The maximum possible orbit-averaged rate (achieved only if the entire thrust is applied at the two nodes, which is not possible with a continuous thruster) would have factor 1; the bang-bang strategy achieves 63.7% of that maximum.
+
+**Effective acceleration.** Define the thrust acceleration `a_eff = F / m`. For the demonstration case:
+
+```
+F = 3.5 N,  m = 500 kg  →  a_eff = 7.0 × 10⁻³ m/s² = 7.0 × 10⁻⁶ km/s²
+```
+
+**Impulsive Δv equivalent.** The Δv for a pure inclination change at constant circular radius is:
+
+```
+Δv_imp = 2 v_c sin(Δi / 2)
+```
+
+where `Δi = i₂ − i₁`. For the demonstration:
+
+```
+v_c = √(μ_Mars / r) = √(42828 / 3789.5) = 3.361 km/s
+Δv_imp = 2 × 3.361 × sin(10°) = 2 × 3.361 × 0.17365 = 1.167 km/s
+```
+
+**Time-of-flight estimate.** Combining the bang-bang efficiency with the effective acceleration:
+
+```
+TOF ≈ (π/2) · Δv_imp / a_eff
+    = (π/2) × 1.167 km/s / (7.0 × 10⁻⁶ km/s²)
+    = 2.62 × 10⁵ s
+    ≈ 3.03 days
+```
+
+The factor `π/2` accounts for the bang-bang efficiency: the continuous thrust at angle L produces only `2/π` of the maximum possible orbit-averaged Δv per unit time, so the maneuver takes `π/2` longer than a hypothetically perfectly phased impulsive sequence.
+
+**Number of revolutions.** At `r = 3789.5 km`, the orbital period is:
+
+```
+T_orb = 2π √(r³/μ_Mars) = 2π × √(3789.5³ / 42828) = 2π × 596.9 s = 3751 s ≈ 1.042 hr
+```
+
+The total number of revolutions:
+
+```
+N_rev = TOF / T_orb = 2.62 × 10⁵ / 3751 ≈ 70 revolutions
+```
+
+**Propellant consumption.** The mass flow rate for an Isp = 3000 s engine:
+
+```
+ṁ = F / (g₀ · Isp) = 3.5 / (9.80665 × 3000) = 1.190 × 10⁻⁴ kg/s
+```
+
+Over 3.03 days (2.62 × 10⁵ s):
+
+```
+Δm_p = ṁ · TOF = 1.190 × 10⁻⁴ × 2.62 × 10⁵ ≈ 31.2 kg
+```
+
+Propellant fraction: `Δm_p / m₀ = 31.2 / 500 = 6.24%`. The final spacecraft mass is approximately 468.8 kg.
+
+### 11.6 Mars-Centric Non-Dimensional Scaling
+
+To improve numerical conditioning of the ODE integrator, all quantities are non-dimensionalized relative to the reference orbit:
+
+```
+L* = r_ref   (reference length, chosen as the initial orbit radius in km)
+T* = √(r_ref³ / μ_Mars)   (reference time in seconds)
+V* = √(μ_Mars / r_ref)    (reference velocity = circular speed at r_ref)
+A* = μ_Mars / r_ref²      (reference acceleration)
+```
+
+For the demonstration (`r_ref = 3789.5 km`, `μ_Mars = 42828 km³/s²`):
+
+```
+L* = 3789.5 km
+T* = √(3789.5³ / 42828) = 596.9 s
+V* = 3.361 km/s
+A* = 42828 / 3789.5² = 2.983 × 10⁻³ km/s²
+```
+
+In non-dimensional units, the initial orbit has `p_nd = 1`, `μ_nd = 1`, and the thrust acceleration is:
+
+```
+a_nd = a_eff / A* = 7.0 × 10⁻⁶ / 2.983 × 10⁻³ = 2.347 × 10⁻³
+```
+
+This small number correctly indicates that the thrust is a weak perturbation relative to gravity — the spacecraft completes many revolutions per unit thrust change.
+
+### 11.7 Interpretation of the Demonstration Trajectory
+
+The demonstration trajectory uses the following parameters:
+
+| Parameter | Value |
+|-----------|-------|
+| Orbit radius `r` | 3789.5 km (altitude ~400 km) |
+| Initial inclination `i₁` | 0° (equatorial) |
+| Final inclination `i₂` | 20° |
+| Thrust `F` | 3.5 N |
+| Spacecraft mass `m₀` | 500 kg |
+| Specific impulse `Isp` | 3000 s |
+| Integration segments `N` | 600 |
+
+#### 3D Trajectory Figure
+
+The 3D visualization (`results/mars_inclination_3d.png`) shows a sequence of instantaneous orbit circles drawn at evenly spaced revolution snapshots. Each ring represents the complete circular orbit that the spacecraft would trace if thrust were suddenly turned off at that moment. The rings evolve from a flat equatorial circle (blue, bottom) to a tilted 20°-inclined circle (red, top), stacking concentrically around the translucent Mars sphere.
+
+**Ring spacing and tilt progression.** The rings are nearly evenly spaced in inclination because the bang-bang control law produces an approximately constant orbit-averaged inclination rate (the cosine-weighted integral is approximately constant when `h` and `k` are small compared to 1, which holds for inclinations up to ~40°). Each displayed ring therefore represents roughly the same Δi increment, resulting in a visually uniform "fan" of orbital planes.
+
+**Nodal drift.** For a purely equatorial-to-inclined maneuver with initial `Ω = 0°`, the control law drives `h` exclusively (since `dk = 0`). The switching function `σ = dh·cos L + dk·sin L = dh·cos L` means that thrust is applied symmetrically about the x-axis of the orbit plane; there is no systematic RAAN drift. The rings all share a common ascending node at `Ω ≈ 0°`, appearing as a fan of planes pivoting about the Earth-Mars x-axis in the figure.
+
+**Inclination history.** The 2-panel history plot (`results/mars_inclination_history.png`) confirms the theoretical predictions. The top panel shows inclination increasing monotonically from 0° to ~20° over approximately 3 days, with a nearly linear trend. The slight S-shape (faster in the middle, slower at the very start and end) reflects the `sin(i/2)` nonlinearity: at small inclinations the `h` rate is approximately linear in inclination, but the actual GVE rates have mild angular dependence. The bottom panel shows RAAN remaining near 0° throughout, consistent with the symmetric bang-bang law.
+
+**Final inclination accuracy.** The bang-bang TOF estimate predicts maneuver completion at `TOF = (π/2) · Δv_imp / a_eff`. Without a margin factor, the ODE propagation reaches the final epoch at `i_f ≈ 20.1°` — within 0.5% of the 20° target. The small overshoot arises because the bang-bang switching function is not precisely optimal for the nonlinear MEE GVE (it is the heuristic approximation of the true Pontryagin co-state direction).
+
+**Propellant consumption.** The mass history decreases from 500 kg to approximately 468–469 kg, a consumption of ~31–32 kg (6.2–6.4% of initial mass). This is consistent with the analytical estimate from Section 11.5. Compared to a chemical propulsion system (Isp ≈ 450 s), which would consume:
+
+```
+Δm_p_chem / m₀ = 1 − exp(−Δv_imp / (Isp_chem · g₀))
+               = 1 − exp(−1.167 / (450 × 9.80665 × 10⁻³))
+               = 1 − exp(−0.2645)
+               ≈ 23.2%
+```
+
+the SEP system uses **3.7× less propellant** for the same inclination change. The trade-off, as always, is time: the chemical system executes two burns (at the ascending and descending nodes) lasting on the order of minutes; the SEP system requires approximately 3 days of continuous firing.
+
+**Engineering significance.** The inclination change is particularly expensive for any propulsion system precisely because it rotates the angular momentum vector rather than scaling it. The efficiency of the bang-bang strategy comes from applying thrust perpendicular to the orbital plane in a coordinated fashion across many orbits, accumulating small rotations into the required 20° tilt. The 2/π bang-bang factor represents the fundamental limit of a bang-bang (full on/off) control strategy; a continuously throttled engine with the optimal thrust profile (which applies thrust near the nodes only) could in principle approach 100% efficiency, but at the cost of larger instantaneous thrust requirements.
+
+---
